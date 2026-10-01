@@ -54,7 +54,11 @@ type Options struct {
 	KubeletRestart func(ctx context.Context) error
 	// APIServerReachableProbe reports whether the LOCAL apiserver answers /healthz
 	// (ADR-12-R1); nil -> a /healthz probe to 127.0.0.1 on the cluster's
-	// localAPIEndpoint.bindPort (6443 when unset).
+	// localAPIEndpoint.bindPort (6443 when unset). Unlike the other probes in
+	// this block it is consulted on every pass, pinned or not: on an
+	// Initialized node it decides whether the control plane counts as healthy,
+	// and it is polled through a bounded grace period (controlplanehealth.go)
+	// before a down apiserver is reported.
 	APIServerReachableProbe func(ctx context.Context) bool
 
 	// KubeletHealthyProbe reports local kubelet liveness (actualstate.State.
@@ -66,6 +70,15 @@ type Options struct {
 	// kubeadm itself waits on. Inject a fake in tests that need a healthy or
 	// degraded fixture without a real kubelet.
 	KubeletHealthyProbe func(ctx context.Context) bool
+
+	// InitFinishedProbe reports whether the cluster shows that this node's
+	// `kubeadm init` ran past kubelet-finalize (one of the addon phase's
+	// objects exists), or an error when the cluster could not be asked.
+	// Consulted only when the files say InitIncomplete and the local apiserver
+	// answers: kubeadm's own recovery for a failed kubelet client-certificate
+	// rotation leaves the same files on a healthy node. nil ->
+	// initFinishedViaKubectl (controlplanehealth.go).
+	InitFinishedProbe func(ctx context.Context) (bool, error)
 }
 
 // Options also carries an injectable StatusSink for testing; nil -> production
@@ -125,11 +138,12 @@ func Run(ctx context.Context, cluster clusterplugin.Cluster, opts Options) error
 		finalErr        error
 		finalState      actualstate.State
 		finalLastAction reconcile.Action
-		// finalDegraded is D-2's signal: reconcile.Plan returned VerdictDegraded
-		// (an already-established member whose kubelet is not healthy). It must
-		// only ever suppress a would-be Converged status, never mask a real
-		// error -- BuildStatus only consults it on the p.Err == nil path.
-		finalDegraded bool
+		// finalVerdict is reconcile.Plan's member verdict. A degraded one (an
+		// already-established member whose kubelet is down, whose init never
+		// finished, or whose control plane is not serving) must only ever
+		// suppress a would-be Converged status, never mask a real error --
+		// BuildStatus only consults it on the p.Err == nil path.
+		finalVerdict reconcile.Verdict
 	)
 	// Defer record-then-return: runs exactly once on every exit path.
 	defer func() {
@@ -141,7 +155,7 @@ func Run(ctx context.Context, cluster clusterplugin.Cluster, opts Options) error
 			LastAction: finalLastAction,
 			Err:        finalErr,
 			Result:     finalResult,
-			Degraded:   finalDegraded,
+			Verdict:    finalVerdict,
 			Now:        time.Now().UTC().Format(time.RFC3339),
 			BootID:     bootID,
 			Version:    providerVersion,
@@ -221,10 +235,14 @@ func Run(ctx context.Context, cluster clusterplugin.Cluster, opts Options) error
 		if prober.RunningKubeletVersion == nil {
 			prober.RunningKubeletVersion = runningKubeletVersionViaKubectl(pctx.RootPath, kubectlRunner)
 		}
-		prober.APIServerReachable = opts.APIServerReachableProbe
-		if prober.APIServerReachable == nil {
-			prober.APIServerReachable = localAPIHealthyProbe(in.BindPort)
-		}
+	}
+	// Unconditional as well: on an Initialized node Plan's base path needs it to
+	// tell a serving control plane from one that is not (a live kubelet says
+	// nothing about the static pods it runs), and the upgrade path uses the
+	// same answer to decide on a kubelet-config repair (ADR-12-R1).
+	prober.APIServerReachable = opts.APIServerReachableProbe
+	if prober.APIServerReachable == nil {
+		prober.APIServerReachable = localAPIHealthyProbe(in.BindPort)
 	}
 
 	state, err := prober.Probe(ctx)
@@ -234,7 +252,53 @@ func Run(ctx context.Context, cluster clusterplugin.Cluster, opts Options) error
 		return err
 	}
 	actions, verdict := reconcile.Plan(role, target, state)
-	finalDegraded = verdict == reconcile.VerdictDegraded
+	if verdict == reconcile.VerdictControlPlaneUnhealthy || verdict == reconcile.VerdictInitIncomplete {
+		// Both verdicts are settled against the local apiserver. After a reboot
+		// the kubelet starts the static pods only once it is up itself, so a
+		// healthy control plane's apiserver is often still coming up while this
+		// pass runs: give it a bounded grace period before reporting it.
+		if !state.APIServerReachable {
+			logrus.Infof("provider-kubernetes: the local apiserver is not answering /healthz yet; waiting up to %s before reporting it", controlPlaneGrace)
+			if awaitLocalAPIServer(ctx, prober.APIServerReachable, controlPlaneGrace, controlPlanePoll) {
+				logrus.Info("provider-kubernetes: the local apiserver is answering /healthz")
+				state.APIServerReachable = true
+			} else if ctx.Err() != nil {
+				// The reconcile subcommand runs without a deadline of its own, so
+				// in production only the grace ends the wait; a caller that sets
+				// one is told which limit did.
+				logrus.Warnf("provider-kubernetes: the wait for the local apiserver was cut short by the pass's own deadline (%v)", ctx.Err())
+			} else {
+				logrus.Warnf("provider-kubernetes: the local apiserver did not answer /healthz within %s", controlPlaneGrace)
+			}
+		}
+		// The files behind InitIncomplete are also what kubeadm's documented
+		// recovery for a failed kubelet client-certificate rotation leaves on a
+		// node whose init finished long ago. Ask the cluster before reporting it.
+		if state.InitIncomplete && state.APIServerReachable {
+			initFinished := opts.InitFinishedProbe
+			if initFinished == nil {
+				initFinished = initFinishedViaKubectl(pctx.RootPath, in.BindPort, kubeadm.KubectlRunner())
+			}
+			finished, err := initFinished(ctx)
+			switch {
+			case err != nil:
+				// Not evidence either way (for example admin.conf's certificate
+				// expired): say only that the question went unanswered.
+				logrus.Warnf("provider-kubernetes: kubelet.conf still embeds its client certificate, and the cluster "+
+					"could not be asked whether kubeadm init finished (%v); reporting InitIncomplete unconfirmed", err)
+			case finished:
+				logrus.Info("provider-kubernetes: kubelet.conf still embeds its client certificate, but the cluster has the objects " +
+					"kubeadm init's addon phase creates, so init finished and kubelet.conf was re-issued later")
+				state.InitIncomplete = false
+			default:
+				logrus.Warn("provider-kubernetes: kubelet.conf still embeds its client certificate and the cluster shows no " +
+					"CoreDNS or kube-proxy addon: kubeadm init did not finish on this node")
+			}
+		}
+		finalState = state
+		actions, verdict = reconcile.Plan(role, target, state)
+	}
+	finalVerdict = verdict
 
 	var join *credential.JoinMaterial
 	if role == actualstate.RoleWorker || role == actualstate.RoleControlPlane {
@@ -263,7 +327,7 @@ func Run(ctx context.Context, cluster clusterplugin.Cluster, opts Options) error
 		ClusterVersion:      state.ClusterVersion,
 		ClusterVersionProbe: prober.ClusterVersion,     // re-check + follower wait (nil when no target)
 		KubeletRestart:      opts.KubeletRestart,       // nil -> systemctl (production)
-		LocalAPIReachable:   prober.APIServerReachable, // post-repair local-API wait (nil when no target)
+		LocalAPIReachable:   prober.APIServerReachable, // post-repair local-API wait
 	}
 	// Best-effort pre-apply etcd snapshot on a control plane only (ADR-12 U5,
 	// revised by ADR-12-A1). etcdsnapshot.Run defaults EncryptionConfirmed to its

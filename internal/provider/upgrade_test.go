@@ -115,7 +115,7 @@ func TestRunningKubeletVersionViaKubectl_ExactArgvAndStdoutOnly(t *testing.T) {
 	fr := &fakeRunner{respond: func(args []string) (kubeadm.Result, error) {
 		return kubeadm.Result{Stdout: "v1.37.0", Stderr: "Warning: this is noise and must never be parsed"}, nil
 	}}
-	got := runningKubeletVersionViaKubectl(root, fr)(context.Background())
+	got := runningKubeletVersionViaKubectl(root, "", fr)(context.Background())
 
 	if got != "v1.37.0" {
 		t.Fatalf("runningKubeletVersionViaKubectl = %q, want v1.37.0", got)
@@ -132,7 +132,7 @@ func TestRunningKubeletVersionViaKubectl_RunnerErrorReturnsEmpty(t *testing.T) {
 	fr := &fakeRunner{respond: func([]string) (kubeadm.Result, error) {
 		return kubeadm.Result{}, fmt.Errorf("kubectl: boom")
 	}}
-	if got := runningKubeletVersionViaKubectl(root, fr)(context.Background()); got != "" {
+	if got := runningKubeletVersionViaKubectl(root, "", fr)(context.Background()); got != "" {
 		t.Fatalf("runningKubeletVersionViaKubectl = %q, want empty on runner error", got)
 	}
 }
@@ -147,7 +147,7 @@ func TestRunningKubeletVersionViaKubectl_NeverParsesStderr(t *testing.T) {
 	fr := &fakeRunner{respond: func([]string) (kubeadm.Result, error) {
 		return kubeadm.Result{Stdout: "", Stderr: "v9.9.9"}, nil
 	}}
-	if got := runningKubeletVersionViaKubectl(root, fr)(context.Background()); got != "" {
+	if got := runningKubeletVersionViaKubectl(root, "", fr)(context.Background()); got != "" {
 		t.Fatalf("runningKubeletVersionViaKubectl = %q, want empty: Stderr must never be parsed", got)
 	}
 }
@@ -155,7 +155,7 @@ func TestRunningKubeletVersionViaKubectl_NeverParsesStderr(t *testing.T) {
 func TestRunningKubeletVersionViaKubectl_NoKubeconfigNeverInvokesRunner(t *testing.T) {
 	root := t.TempDir()
 	fr := &fakeRunner{}
-	if got := runningKubeletVersionViaKubectl(root, fr)(context.Background()); got != "" {
+	if got := runningKubeletVersionViaKubectl(root, "", fr)(context.Background()); got != "" {
 		t.Fatalf("runningKubeletVersionViaKubectl = %q, want empty with no kubeconfig", got)
 	}
 	if len(fr.calls) != 0 {
@@ -205,5 +205,52 @@ func TestLocalAPIHealthyProbe_FollowsBindPort(t *testing.T) {
 func TestLocalAPIHealthyProbe_UnsetBindPortUsesDefault(t *testing.T) {
 	if got := kubeadmconfig.LocalAPIHealthzURL(0); got != "https://127.0.0.1:6443/healthz" {
 		t.Fatalf("unset bindPort probes %q", got)
+	}
+}
+
+// A cluster may set initConfiguration.nodeRegistration.name (samples/cluster.yaml
+// documents it as "defaults to the node's hostname"), and the provider renders it
+// into both the init and the join config, so kubeadm registers the Node under that
+// name. Asking for the hostname instead gets a NotFound, which the probe reports as
+// an empty version -- and reconcile.planUpgrade reads an empty version as "worker
+// convergence unknown" and takes no action at all, so the worker silently never
+// upgrades.
+func TestRunningKubeletVersionViaKubectl_AsksForTheConfiguredNodeName(t *testing.T) {
+	root := t.TempDir()
+	kc := writeKubeconfig(t, root, "kubelet.conf")
+	const nodeName = "worker-7"
+	host, err := os.Hostname()
+	if err == nil && strings.EqualFold(host, nodeName) {
+		t.Skip("this host is already named like the fixture; nothing to distinguish")
+	}
+	wantArgs := []string{
+		"--kubeconfig", kc,
+		"get", "node", nodeName,
+		"-o", "jsonpath={.status.nodeInfo.kubeletVersion}",
+	}
+
+	fr := &fakeRunner{respond: func([]string) (kubeadm.Result, error) {
+		return kubeadm.Result{Stdout: "v1.36.4\n"}, nil
+	}}
+	if got := runningKubeletVersionViaKubectl(root, nodeName, fr)(context.Background()); got != "v1.36.4" {
+		t.Fatalf("runningKubeletVersionViaKubectl = %q, want v1.36.4", got)
+	}
+	if len(fr.calls) != 1 || !slices.Equal(fr.calls[0], wantArgs) {
+		t.Fatalf("argv = %v, want %v", fr.calls, wantArgs)
+	}
+}
+
+// The configured name is used verbatim: kubeadm lower-cases only the hostname it
+// derives itself, so a name the operator wrote is the name the Node carries.
+func TestRunningKubeletVersionViaKubectl_DoesNotRewriteTheConfiguredNodeName(t *testing.T) {
+	root := t.TempDir()
+	writeKubeconfig(t, root, "kubelet.conf")
+
+	fr := &fakeRunner{respond: func([]string) (kubeadm.Result, error) {
+		return kubeadm.Result{Stdout: "v1.36.4"}, nil
+	}}
+	runningKubeletVersionViaKubectl(root, "Worker-7", fr)(context.Background())
+	if len(fr.calls) != 1 || !slices.Contains(fr.calls[0], "Worker-7") {
+		t.Fatalf("argv = %v, want it to carry the configured name verbatim", fr.calls)
 	}
 }

@@ -242,19 +242,17 @@ first attempt fail, then reset the node's Kubernetes state and reboot it so it
 initializes again:
 
 ```sh
-mount | grep ' on /var/lib/kubelet/'    # must print nothing: no volume mounted below it
 sudo /system/providers/agent-provider-kubernetes reset --cluster-file=/run/provider-kubernetes/cluster.json
 sudo reboot
 ```
 
-The reset removes this node's etcd data and everything under
-`/var/lib/kubelet`, including the contents of any volume still mounted there,
-which is why the first line must print nothing. On the node that
-ran `kubeadm init` the etcd data is the cluster itself, so also make sure no
-other node joined it and nothing you need runs on it. On Kairos the command can
-exit 1 because `/etc/kubernetes` and `/var/lib/kubelet` are mount points that
-cannot themselves be removed; their contents are, and the node initializes
-again on the next boot.
+The reset removes this node's etcd data and the kubelet's state. It never
+touches a volume that is still mounted under `/var/lib/kubelet`: it leaves it
+in place, names it, and fails with `reason: ResetFailed`, so unmount it and run
+the reset again before rebooting (see
+[A reset failed](#a-reset-failed-mount-points-left-in-place)). On the node
+that ran `kubeadm init` the etcd data is the cluster itself, so also make sure
+no other node joined it and nothing you need runs on it.
 
 #### `reason: ControlPlaneUnhealthy`
 
@@ -531,10 +529,71 @@ hold every Secret, are plaintext unless the persistent partition is encrypted, a
 share a device with etcd. Once an upgrade is verified, delete the older copies; see
 [Upgrades](./upgrades.md#etcd-backups).
 
+### A reset failed: `mount points left in place`
+
+```text
+reason: ResetFailed
+message: reset failed: 1 mount point under the artifact directories left in place (the reset log names them); unmount them and run the reset again
+```
+
+`kubeadm reset` could not unmount a volume under `/var/lib/kubelet`, usually
+because something still uses it. The reset left that volume and its data alone
+and removed everything else. **Do not delete what is left by hand** (`rm -rf`):
+that deletes the data on the mounted volume, which can be shared storage that
+other nodes still use. It is exactly what the reset refuses to do.
+
+1. List what is still mounted:
+
+   ```sh
+   sudo findmnt -R /var/lib/kubelet
+   ```
+
+2. Remove the pods `kubeadm reset` did not get to. It stops before removing
+   containers when an unmount fails, and they are the usual holders:
+
+   ```sh
+   sudo /usr/bin/crictl --runtime-endpoint unix:///run/containerd/containerd.sock rmp -fa
+   ```
+
+3. Unmount each path the first step listed:
+
+   ```sh
+   sudo umount <path>
+   ```
+
+   If it is still busy, a process on the host holds it. The image has no
+   `fuser`, and its busybox `lsof` does not show working directories; this lists
+   the processes whose working directory, root or open files are inside the
+   path:
+
+   ```sh
+   sudo ls -l /proc/[0-9]*/cwd /proc/[0-9]*/root /proc/[0-9]*/fd 2>/dev/null | grep '<path>'
+   ```
+
+   Stop them, then unmount again. For a network mount whose server is gone,
+   `sudo umount -f <path>`, or as a last resort `sudo umount -l <path>`,
+   detaches it without touching the data. Do not lazily unmount a volume a
+   process still holds open: its filesystem stays mounted underneath, and
+   attaching the same block volume to another node then risks corrupting it.
+
+4. Run the reset again:
+
+   ```sh
+   sudo /system/providers/agent-provider-kubernetes reset --cluster-file=/run/provider-kubernetes/cluster.json
+   ```
+
+Draining the node before a reset (`kubectl drain <node> --ignore-daemonsets
+--delete-emptydir-data`) unmounts most volumes first and makes this less
+likely, but cannot rule it out. DaemonSet and static pods keep their volumes,
+a PodDisruptionBudget can stall the drain, the kubelet unmounts evicted pods'
+volumes asynchronously, and processes outside Kubernetes can hold a mount too.
+
 ### A reset left a stale etcd member (HA)
 
 If a control plane was reset while the cluster was unreachable, its etcd member is
-orphaned. Deregister it from a surviving control plane with `kubectl delete node`
+orphaned. The reset says so with a loud warning when this node's own apiserver did
+not answer or `kubeadm reset` failed. Otherwise it asks you to verify the member is
+gone, since `kubeadm reset` reports a failed removal only as a warning. Deregister it from a surviving control plane with `kubectl delete node`
 and the bundled `/usr/bin/etcdctl` (`member list`, then `member remove <id>`,
 passing the etcd client certificate flags shown in
 [Upgrades](./upgrades.md#etcd-backups)). See

@@ -237,10 +237,10 @@ func boolStr(b bool) string {
 }
 
 // resolveNodeName returns this node's name as Kubernetes knows it: the hostname,
-// lower-cased. This matches the convention kubeadm uses when naming nodes and is
-// consistent with how runningKubeletVersionViaKubectl resolves the node name.
-// Prefer makeNodeResolver with a known node name (from NodeRegistration) over
-// this fallback when the kubeadm node name is available (security Finding D).
+// lower-cased. This is the name kubeadm derives when nodeRegistration.name is
+// unset, so it is only correct as a fallback. Prefer MakeNodeResolver with the
+// known node name (from NodeRegistration) when it is available (security
+// Finding D); the upgrade probes in internal/provider resolve it the same way.
 func resolveNodeName() (string, error) {
 	host, err := os.Hostname()
 	if err != nil {

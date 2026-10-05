@@ -233,7 +233,7 @@ func Run(ctx context.Context, cluster clusterplugin.Cluster, opts Options) error
 		}
 		prober.RunningKubeletVersion = opts.RunningKubeletVersionProbe
 		if prober.RunningKubeletVersion == nil {
-			prober.RunningKubeletVersion = runningKubeletVersionViaKubectl(pctx.RootPath, kubectlRunner)
+			prober.RunningKubeletVersion = runningKubeletVersionViaKubectl(pctx.RootPath, in.NodeName, kubectlRunner)
 		}
 	}
 	// Unconditional as well: on an Initialized node Plan's base path needs it to

@@ -337,6 +337,17 @@ func TestPlanUpgrade(t *testing.T) {
 			want:  []Action{ActionNone},
 		},
 		{
+			// An unreadable running kubelet version is indistinguishable here from
+			// a converged one: both yield ActionNone, and the verdict below is OK,
+			// so nothing downstream reports that the upgrade did not happen. That
+			// is why the probe must ask for the node name kubeadm registered
+			// (internal/provider/upgrade.go) rather than fall back to "".
+			name:    "worker with no readable running version -> silent no-op",
+			desired: actualstate.RoleWorker, target: t135,
+			state: actualstate.State{Membership: actualstate.Joined, KubeletHealthy: true, ClusterVersion: t135, RunningKubeletVersion: ""},
+			want:  []Action{ActionNone},
+		},
+		{
 			name:    "CP refuse skip-level (manifest 1.34 -> target 1.36)",
 			desired: actualstate.RoleControlPlane, target: "v1.36.0",
 			state: actualstate.State{Membership: actualstate.Initialized, APIServerReachable: true, NodeComponentVersion: "v1.34.8"},

@@ -61,18 +61,31 @@ func clusterVersionViaKubectl(rootPath string, r kubeadm.Runner) func(ctx contex
 // runningKubeletVersionViaKubectl reads this node's RUNNING kubelet version from
 // its Node object (status.nodeInfo.kubeletVersion). Best-effort: it parses
 // Result.Stdout only (never Stderr, ADR-1-A1) and returns "" on any error.
-func runningKubeletVersionViaKubectl(rootPath string, r kubeadm.Runner) func(ctx context.Context) string {
+//
+// nodeName is initConfiguration.nodeRegistration.name, the name the provider
+// hands kubeadm for both init and join, so it is the name the Node carries.
+// Empty means the operator left it unset, which kubeadm fills with the
+// lower-cased hostname. Asking for the hostname when a name was configured
+// gets a NotFound, and the empty version that follows reads to
+// reconcile.planUpgrade as "worker convergence unknown": the worker then
+// silently never upgrades (security Finding D, the same resolution
+// status.MakeNodeResolver applies to the Node-annotation sink).
+func runningKubeletVersionViaKubectl(rootPath, nodeName string, r kubeadm.Runner) func(ctx context.Context) string {
 	return func(ctx context.Context) string {
 		kc := kubeconfigFor(rootPath)
 		if kc == "" {
 			return ""
 		}
-		host, err := os.Hostname()
-		if err != nil || host == "" {
-			return ""
+		node := nodeName
+		if node == "" {
+			host, err := os.Hostname()
+			if err != nil || host == "" {
+				return ""
+			}
+			node = strings.ToLower(host)
 		}
 		res, err := r.Run(ctx, "--kubeconfig", kc,
-			"get", "node", strings.ToLower(host),
+			"get", "node", node,
 			"-o", "jsonpath={.status.nodeInfo.kubeletVersion}")
 		if err != nil {
 			return ""
